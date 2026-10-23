@@ -8,6 +8,10 @@
 Claude Code (Anthropic 格式) → solar-proxy (127.0.0.1:8787) → Upstage (OpenAI 格式)
 ```
 
+实际效果（Claude Code 界面，背后是 solar-pro4 在回答）：
+
+![Claude Code 里跑 Solar Pro4](docs/demo-claude-code.png)
+
 ## 为什么写这个
 
 想用 Claude Code 和 Codex CLI，又想省点钱。Upstage 的 solar-pro4 支持 function calling，上下文有 512K，价格便宜不少。麻烦在于协议对不上：Claude Code 只认 Anthropic 格式；新版 Codex CLI（0.149+）砍掉了 chat completions，只认 Responses 格式，而 Upstage 只提供 chat completions。干脆写了一个转换层，两个 CLI 一起解决。
