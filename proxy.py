@@ -338,6 +338,9 @@ class Handler(BaseHTTPRequestHandler):
             _, chars = convert_request(payload)
             return self._json(200, {"input_tokens": max(1, int(chars * 0.75) + 64)})
 
+        if path.endswith("/responses"):
+            return self.handle_responses(payload)
+
         if not path.endswith("/messages"):
             log(f"? 未处理的 POST {self.path}")
             return self._anthropic_error(404, "not_found_error", f"未知路径 {self.path}")
@@ -424,6 +427,322 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             log(f"✗ 流式处理异常: {e!r}")
 
+    # ── Responses API 处理（Codex CLI 走这里）────────────────────
+    def handle_responses(self, payload: dict):
+        requested_model = payload.get("model", "")
+        try:
+            upstream_payload, in_chars = convert_responses_request(payload)
+        except Exception as e:
+            return self._json(400, {"error": {"message": f"请求转换失败: {e}", "type": "invalid_request_error"}})
+
+        want_stream = bool(payload.get("stream"))
+        if want_stream:
+            upstream_payload["stream"] = True
+            upstream_payload["stream_options"] = {"include_usage": True}
+        est_input = max(1, int(in_chars * 0.75) + 64)
+        t0 = time.time()
+        log(f"→R {upstream_payload['model']} | msgs={len(upstream_payload['messages'])} "
+            f"tools={len(upstream_payload.get('tools', []))} | stream={want_stream}")
+
+        try:
+            resp = requests.post(f"{UPSTAGE_BASE}/chat/completions",
+                                 headers={"Authorization": f"Bearer {UPSTAGE_API_KEY}"},
+                                 json=upstream_payload, stream=want_stream, timeout=(10, 600))
+        except requests.RequestException as e:
+            return self._json(502, {"error": {"message": f"上游连接失败: {e}", "type": "api_error"}})
+
+        if resp.status_code != 200:
+            try:
+                detail = resp.json()
+            except ValueError:
+                detail = resp.text[:500]
+            log(f"✗ 上游 {resp.status_code}: {str(detail)[:200]}")
+            return self._json(resp.status_code if resp.status_code < 500 else 502,
+                              {"error": {"message": f"Upstage 错误: {detail}", "type": "api_error"}})
+
+        if not want_stream:
+            chat = resp.json()
+            msg = (chat.get("choices") or [{}])[0].get("message") or {}
+            output = responses_output_items(msg)
+            usage = responses_usage(chat.get("usage"), est_input,
+                                    sum(len(i.get("content", [{}])[0].get("text", ""))
+                                        for i in output if i.get("type") == "message"))
+            log(f"✓ {time.time()-t0:.1f}s in={usage['input_tokens']} out={usage['output_tokens']}")
+            return self._json(200, responses_response_object(requested_model, output, usage))
+
+        # ── 流式 ──
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        transformer = ResponsesStreamTransformer(requested_model, est_input)
+        finish = None
+        try:
+            resp.encoding = "utf-8"
+            self.wfile.write(transformer.start())
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data:"):
+                    continue
+                data_str = raw[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                fr = (chunk.get("choices") or [{}])[0].get("finish_reason")
+                if fr:
+                    finish = fr
+                piece = transformer.on_chunk(chunk)
+                if piece:
+                    self.wfile.write(piece)
+                    self.wfile.flush()
+            self.wfile.write(transformer.finish(finish or "stop"))
+            self.wfile.flush()
+            log(f"✓ {time.time()-t0:.1f}s ~in={est_input} "
+                f"out={transformer.final_usage and transformer.final_usage.get('completion_tokens')} stop={finish}")
+        except (BrokenPipeError, ConnectionResetError):
+            log("客户端断开")
+        except Exception as e:
+            log(f"✗ Responses 流式异常: {e!r}")
+
+
+# ─────────────────────────── Responses API（Codex CLI）───────────────────────────
+
+def convert_responses_request(payload: dict):
+    """OpenAI Responses 格式 → chat completions 格式。返回 (openai_payload, est_input_chars)"""
+    msgs_out, char_count = [], 0
+    id_map = {}
+
+    def rid(tid):
+        if not tid:
+            return tid
+        if tid.startswith("call_"):
+            return tid
+        if tid not in id_map:
+            id_map[tid] = "call_" + uuid.uuid4().hex[:12]
+        return id_map[tid]
+
+    # instructions 相当于 system
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        msgs_out.append({"role": "system", "content": instructions})
+        char_count += len(instructions)
+
+    items = payload.get("input")
+    if isinstance(items, str):
+        items = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": items}]}]
+
+    for item in items or []:
+        t = item.get("type", "message")
+        if t == "message":
+            role = item.get("role", "user")
+            content = item.get("content")
+            if isinstance(content, str):
+                text = content
+            else:
+                text = "\n".join(p.get("text", "") for p in (content or [])
+                                 if isinstance(p, dict) and p.get("type") in ("input_text", "output_text"))
+            if role == "system" or role == "developer":
+                msgs_out.append({"role": "system", "content": text})
+            else:
+                msgs_out.append({"role": role, "content": text})
+            char_count += len(text)
+        elif t == "function_call":
+            msgs_out.append({"role": "assistant", "content": "",
+                             "tool_calls": [{"id": rid(item.get("call_id")), "type": "function",
+                                             "function": {"name": item.get("name", ""),
+                                                          "arguments": item.get("arguments") or "{}"}}]})
+        elif t == "function_call_output":
+            out = item.get("output")
+            if not isinstance(out, str):
+                out = json.dumps(out, ensure_ascii=False)
+            msgs_out.append({"role": "tool", "tool_call_id": rid(item.get("call_id")), "content": out})
+            char_count += len(out)
+        # reasoning / local_shell_call 等块跳过（solar 不支持回放思考历史）
+
+    out = {"model": map_model(payload.get("model", "")), "messages": msgs_out,
+           "max_tokens": min(int(payload.get("max_output_tokens") or 8192), 32768)}
+    if payload.get("temperature") is not None:
+        out["temperature"] = payload["temperature"]
+    if payload.get("top_p") is not None:
+        out["top_p"] = payload["top_p"]
+
+    reasoning = payload.get("reasoning") or {}
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        out["reasoning_effort"] = {"minimal": "low", "xhigh": "high"}.get(reasoning["effort"], reasoning["effort"])
+
+    tools = []
+    for t in payload.get("tools", []):
+        if t.get("type") == "function":
+            params = dict(t.get("parameters") or {})
+            params.pop("$schema", None)
+            tools.append({"type": "function",
+                          "function": {"name": t.get("name", ""), "description": t.get("description", ""),
+                                       "parameters": params}})
+            char_count += len(json.dumps(t, ensure_ascii=False)) // 2
+    if tools:
+        out["tools"] = tools
+
+    tc = payload.get("tool_choice")
+    if isinstance(tc, dict) and tc.get("type") == "function":
+        out["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+    elif tc in ("auto", "none", "required"):
+        out["tool_choice"] = tc
+
+    return out, char_count
+
+
+def responses_output_items(message: dict):
+    """chat completions 的 message → Responses output 数组"""
+    items, content_parts = [], []
+    if message.get("content"):
+        content_parts.append({"type": "message", "id": "msg_" + uuid.uuid4().hex[:16], "role": "assistant",
+                              "status": "completed",
+                              "content": [{"type": "output_text", "text": message["content"], "annotations": []}]})
+        items.append(content_parts[0])
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        args = fn.get("arguments") or "{}"
+        try:
+            json.loads(args)
+        except json.JSONDecodeError:
+            args = json.dumps({"_raw": args}, ensure_ascii=False)
+        items.append({"type": "function_call", "id": "fc_" + uuid.uuid4().hex[:16],
+                      "call_id": tc.get("id") or ("call_" + uuid.uuid4().hex[:12]),
+                      "name": fn.get("name", ""), "arguments": args, "status": "completed"})
+    if not items:
+        items.append({"type": "message", "id": "msg_" + uuid.uuid4().hex[:16], "role": "assistant",
+                      "status": "completed",
+                      "content": [{"type": "output_text", "text": "(空响应)", "annotations": []}]})
+    return items
+
+
+def responses_usage(chat_usage: dict, est_input: int, out_chars: int) -> dict:
+    it = (chat_usage or {}).get("prompt_tokens") or est_input
+    ot = (chat_usage or {}).get("completion_tokens") or max(1, out_chars // 3)
+    return {"input_tokens": it, "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": ot, "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": it + ot}
+
+
+def responses_response_object(model: str, output: list, usage: dict, status: str = "completed") -> dict:
+    return {"id": "resp_" + uuid.uuid4().hex[:24], "object": "response", "created_at": int(time.time()),
+            "status": status, "model": model, "output": output,
+            "parallel_tool_calls": False, "previous_response_id": None, "reasoning": None,
+            "store": False, "temperature": None, "tool_choice": "auto", "tools": [], "top_p": None,
+            "usage": usage, "error": None, "incomplete_details": None, "metadata": {}}
+
+
+class ResponsesStreamTransformer:
+    """OpenAI chat chunk 流 → Responses API SSE 事件流"""
+
+    def __init__(self, model: str, est_input: int):
+        self.model = model
+        self.resp_id = "resp_" + uuid.uuid4().hex[:24]
+        self.est_input = est_input
+        self.next_index = 0
+        self.text = None       # {"item_id", "text"} 消息块打开时非 None
+        self.calls = {}        # chat tool index → {"item_id","call_id","name","args","out_index"}
+        self.final_usage = None
+        self.out_chars = 0
+
+    def sse(self, ev: dict) -> bytes:
+        data = json.dumps(ev, ensure_ascii=False)
+        return f"event: {ev['type']}\ndata: {data}\n\n".encode()
+
+    def _resp_skeleton(self, status="in_progress"):
+        return {"id": self.resp_id, "object": "response", "created_at": int(time.time()),
+                "status": status, "model": self.model, "output": [], "parallel_tool_calls": False,
+                "previous_response_id": None, "reasoning": None, "store": False, "temperature": None,
+                "tool_choice": "auto", "tools": [], "top_p": None, "usage": None,
+                "error": None, "incomplete_details": None, "metadata": {}}
+
+    def start(self) -> bytes:
+        return self.sse({"type": "response.created", "response": self._resp_skeleton()})
+
+    def on_chunk(self, chunk: dict) -> bytes:
+        out = b""
+        if chunk.get("usage"):
+            self.final_usage = chunk["usage"]
+        choices = chunk.get("choices") or []
+        if not choices:
+            return out
+        delta = choices[0].get("delta") or {}
+
+        text = delta.get("content")
+        if text:
+            self.out_chars += len(text)
+            if self.text is None:
+                item_id = "msg_" + uuid.uuid4().hex[:16]
+                self.text = {"item_id": item_id, "text": ""}
+                oi = self.next_index
+                self.next_index += 1
+                self.text["out_index"] = oi
+                out += self.sse({"type": "response.output_item.added", "output_index": oi,
+                                 "item": {"type": "message", "id": item_id, "role": "assistant",
+                                          "status": "in_progress", "content": []}})
+                out += self.sse({"type": "response.content_part.added", "item_id": item_id,
+                                 "output_index": oi, "content_index": 0,
+                                 "part": {"type": "output_text", "text": "", "annotations": []}})
+            self.text["text"] += text
+            out += self.sse({"type": "response.output_text.delta", "item_id": self.text["item_id"],
+                             "output_index": self.text["out_index"], "content_index": 0, "delta": text})
+
+        for tc in delta.get("tool_calls") or []:
+            ci = tc.get("index", 0)
+            call = self.calls.setdefault(ci, {"item_id": None, "call_id": None, "name": "",
+                                              "args": "", "out_index": None})
+            fn = tc.get("function") or {}
+            if call["out_index"] is None:
+                call["item_id"] = "fc_" + uuid.uuid4().hex[:16]
+                call["call_id"] = tc.get("id") or ("call_" + uuid.uuid4().hex[:12])
+                call["name"] = fn.get("name", "")
+                call["out_index"] = self.next_index
+                self.next_index += 1
+                out += self.sse({"type": "response.output_item.added", "output_index": call["out_index"],
+                                 "item": {"type": "function_call", "id": call["item_id"],
+                                          "call_id": call["call_id"], "name": call["name"],
+                                          "arguments": "", "status": "in_progress"}})
+            args = fn.get("arguments")
+            if args:
+                call["args"] += args
+                out += self.sse({"type": "response.function_call_arguments.delta",
+                                 "item_id": call["item_id"], "output_index": call["out_index"], "delta": args})
+        return out
+
+    def finish(self, finish_reason: str) -> bytes:
+        out = b""
+        output = []
+        if self.text is not None:
+            msg_item = {"type": "message", "id": self.text["item_id"], "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": self.text["text"], "annotations": []}]}
+            out += self.sse({"type": "response.output_text.done", "item_id": self.text["item_id"],
+                             "output_index": self.text["out_index"], "content_index": 0,
+                             "text": self.text["text"]})
+            out += self.sse({"type": "response.output_item.done",
+                             "output_index": self.text["out_index"], "item": msg_item})
+            output.append(msg_item)
+        for ci in sorted(self.calls):
+            c = self.calls[ci]
+            fc_item = {"type": "function_call", "id": c["item_id"], "call_id": c["call_id"],
+                       "name": c["name"], "arguments": c["args"] or "{}", "status": "completed"}
+            out += self.sse({"type": "response.function_call_arguments.done", "item_id": c["item_id"],
+                             "output_index": c["out_index"], "arguments": fc_item["arguments"]})
+            out += self.sse({"type": "response.output_item.done",
+                             "output_index": c["out_index"], "item": fc_item})
+            output.append(fc_item)
+        usage = responses_usage(self.final_usage, self.est_input, self.out_chars)
+        resp = self._resp_skeleton("completed" if finish_reason != "length" else "incomplete")
+        resp["output"] = output
+        resp["usage"] = usage
+        if finish_reason == "length":
+            resp["incomplete_details"] = {"reason": "max_output_tokens"}
+        out += self.sse({"type": "response.completed", "response": resp})
+        return out
+
 
 def main():
     if not UPSTAGE_API_KEY:
@@ -435,10 +754,18 @@ def main():
     print(f"solar-proxy 已启动: http://127.0.0.1:{PORT}")
     print(f"  主模型 → {BIG_MODEL}   轻量模型(haiku槽位) → {SMALL_MODEL}")
     print(f"  上游: {UPSTAGE_BASE}")
-    print("Claude Code 接法:")
+    print("Claude Code 接法 (Anthropic 协议 /v1/messages):")
     print(f'  export ANTHROPIC_BASE_URL=http://127.0.0.1:{PORT}')
     print('  export ANTHROPIC_AUTH_TOKEN=local-proxy')
     print('  export ANTHROPIC_MODEL=solar-pro4')
+    print("Codex CLI 接法 (Responses 协议 /v1/responses) — ~/.codex/config.toml:")
+    print('  model = "solar-pro4"')
+    print('  model_provider = "upstage"')
+    print('  [model_providers.upstage]')
+    print('  name = "Upstage"')
+    print(f'  base_url = "http://127.0.0.1:{PORT}/v1"')
+    print('  env_key = "UPSTAGE_API_KEY"')
+    print('  wire_api = "responses"')
     server.serve_forever()
 
 

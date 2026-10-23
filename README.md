@@ -1,8 +1,8 @@
 # solar-proxy
 
-把 Upstage 的 Solar 模型反代成本地 Anthropic API，给 Claude Code 用。
+把 Upstage 的 Solar 模型反代成本地 API，给 Claude Code 和 Codex CLI 用。
 
-就一个文件，`proxy.py` 四百来行，除了 Python3 和 requests 不需要装任何东西。跑起来之后 Claude Code 以为自己在跟 `claude-sonnet-4-5` 说话，实际背后是 `solar-pro4`。
+就一个文件，`proxy.py` 七百来行，除了 Python3 和 requests 不需要装任何东西。同时说两种协议：Claude Code 走 Anthropic 格式（`/v1/messages`），Codex CLI 走 OpenAI Responses 格式（`/v1/responses`），背后都是 `solar-pro4`。
 
 ```
 Claude Code (Anthropic 格式) → solar-proxy (127.0.0.1:8787) → Upstage (OpenAI 格式)
@@ -10,7 +10,7 @@ Claude Code (Anthropic 格式) → solar-proxy (127.0.0.1:8787) → Upstage (Ope
 
 ## 为什么写这个
 
-想用 Claude Code，又想省点钱。Upstage 的 solar-pro4 支持 function calling，上下文有 512K，价格便宜不少。问题是它是 OpenAI 格式的接口，Claude Code 只认 Anthropic 格式，中间就差一个转换层，干脆自己写了一个。
+想用 Claude Code 和 Codex CLI，又想省点钱。Upstage 的 solar-pro4 支持 function calling，上下文有 512K，价格便宜不少。麻烦在于协议对不上：Claude Code 只认 Anthropic 格式；新版 Codex CLI（0.149+）砍掉了 chat completions，只认 Responses 格式，而 Upstage 只提供 chat completions。干脆写了一个转换层，两个 CLI 一起解决。
 
 ## 能干什么
 
@@ -18,6 +18,7 @@ Claude Code (Anthropic 格式) → solar-proxy (127.0.0.1:8787) → Upstage (Ope
 - function calling 双向转换。Claude Code 的多轮工具任务实测能跑通（建文件→运行→汇报，全程五轮工具调用没掉链子）
 - 模型自动分配：名字里带 haiku 的走 solar-mini4（便宜），其他走 solar-pro4，想改用环境变量覆盖
 - Claude Code 的 thinking 预算自动映射成 reasoning_effort
+- OpenAI Responses API（`/v1/responses`）：新版 Codex CLI 直接接，连 function_call 流式增量都转好了
 - solar-pro4 本身有 512K 上下文，配置里加了 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=512000` 就能吃满（Claude Code 默认按 200K 管理上下文）
 
 ## 踩坑记录
@@ -90,6 +91,27 @@ sqlite3 ~/.cc-switch/cc-switch.db "INSERT INTO providers (
 重新打开 cc-switch 就能看到这个供应商了。表结构各版本可能有差异，拿 `sqlite3 ~/.cc-switch/cc-switch.db ".schema providers"` 确认一下。
 
 **别忘了**：切换过去之后代理得在跑（`./start.sh`），代理没跑 Claude Code 会报连接错误。
+
+### 4. 接入 Codex CLI
+
+Codex CLI（0.149+）原生只说 OpenAI Responses 格式，直接在 `~/.codex/config.toml` 里加一个供应商就行，不用降级：
+
+```toml
+[model_providers.solar]
+name = "Upstage (via solar-proxy)"
+base_url = "http://127.0.0.1:8787/v1"
+env_key = "UPSTAGE_API_KEY"    # 记得 export UPSTAGE_API_KEY=up_xxx
+wire_api = "responses"         # 新版 codex 只认这个
+```
+
+想默认切换、又不想动现有配置，用 v2 profile：把上面三行供应商配置放进 `~/.codex/solar.config.toml`，开头再加两行 `model = "solar-pro4"` 和 `model_provider = "solar"`，然后：
+
+```bash
+codex --profile solar "你的任务"
+# 它会回答自己是 Solar，由韩国 Upstage 开发
+```
+
+注意：老的 `[profiles.solar]` 写法在新版会直接报错拒绝加载，必须用独立文件（`solar.config.toml`）这种方式。
 
 ## 配置
 
