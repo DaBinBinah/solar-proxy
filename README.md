@@ -1,48 +1,37 @@
 # solar-proxy
 
-**把 Upstage Solar 模型反代成 Anthropic API，直接给 Claude Code 用。**
-**Use Upstage Solar models (solar-pro4) in Claude Code via a single-file Anthropic↔OpenAI proxy.**
+把 Upstage 的 Solar 模型反代成本地 Anthropic API，给 Claude Code 用。
+
+就一个文件，`proxy.py` 四百来行，除了 Python3 和 requests 不需要装任何东西。跑起来之后 Claude Code 以为自己在跟 `claude-sonnet-4-5` 说话，实际背后是 `solar-pro4`。
 
 ```
-Claude Code (Anthropic 协议) → solar-proxy (127.0.0.1:8787) → Upstage API (OpenAI 协议)
+Claude Code (Anthropic 格式) → solar-proxy (127.0.0.1:8787) → Upstage (OpenAI 格式)
 ```
 
-Claude Code 以为自己在和 `claude-sonnet-4-5` 说话，实际背后跑的是 `solar-pro4`。
+## 为什么写这个
 
----
+想用 Claude Code，又想省点钱。Upstage 的 solar-pro4 支持 function calling，上下文有 512K，价格便宜不少。问题是它是 OpenAI 格式的接口，Claude Code 只认 Anthropic 格式，中间就差一个转换层，干脆自己写了一个。
 
-## 为什么有这个项目
+## 能干什么
 
-把 Claude Code 接到 OpenAI 兼容上游的方案不少（[claude-code-router](https://github.com/musistudio/claude-code-router)、[LiteLLM](https://github.com/BerriAI/litellm)、[anthropic-proxy](https://github.com/maxnowack/anthropic-proxy) 等），但大多数是 Node/Docker 多组件全家桶。solar-proxy 的取舍是：
+- 流式、非流式都支持，SSE 事件序列是完整的
+- function calling 双向转换。Claude Code 的多轮工具任务实测能跑通（建文件→运行→汇报，全程五轮工具调用没掉链子）
+- 模型自动分配：名字里带 haiku 的走 solar-mini4（便宜），其他走 solar-pro4，想改用环境变量覆盖
+- Claude Code 的 thinking 预算自动映射成 reasoning_effort
+- solar-pro4 本身有 512K 上下文，配置里加了 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=512000` 就能吃满（Claude Code 默认按 200K 管理上下文）
 
-- **单文件**：一个 `proxy.py`（约 400 行），能读懂、能改
-- **零安装**：Python 3.9+ 标准库 + `requests`，没有 npm / Docker / 数据库
-- **针对 Upstage 实测调优**：下面这些坑全部是在真实 Claude Code 多轮 agent 任务中踩出来并修掉的
-- **开箱即用的 cc-switch 集成**：一条 SQLite 插入语句就能注册成切换项
+## 踩坑记录
 
-适合：想在 Claude Code 里用 Upstage Solar 省钱的个人开发者。
-不适合：需要多供应商路由、负载均衡、计费统计的重度团队场景（请用上面的全家桶）。
+做的时候真实踩到的坑，记下来免得再踩一遍：
 
-## 实测踩平的坑
+1. **stream 要自己传**。Anthropic 请求里的 `stream` 字段得显式传给上游，漏了的话上游按非流式返回一整条 JSON，SSE 解析一片空白，还没报错，很难查
+2. **中文乱码**。`text/event-stream` 不带 charset，requests 默认按 latin-1 解码，中文直接变摩尔码，记得手动设 `resp.encoding = "utf-8"`
+3. **路径带查询串**。Claude Code 实际请求的是 `/v1/messages?beta=true`，用 `endswith("/messages")` 判断路径会匹配失败，返回 404，客户端直接以为模型不存在
+4. **工具调用第二轮开始发疯**。对话历史里 assistant 消息的 `content` 写成 null、工具 id 用 Anthropic 的 `toolu_*` 格式，Solar 的模板就乱了，第二轮起工具调用直接以 `<|tool_call:start|>` 这种特殊 token 的形式吐进正文。解决办法：content 给空串，id 全部重写成 `call_*` 格式
 
-这些不是理论问题，是 Claude Code 真实多轮工具调用中逐一复现并修复的：
+## 用法
 
-1. **流式开关透传** —— Anthropic 请求里的 `stream` 必须显式传给上游，否则上游按非流式返回一整条 JSON，SSE 解析静默全空
-2. **SSE 中文乱码** —— `text/event-stream` 不带 charset 时，requests 默认按 latin-1 解码，中文全成摩尔码
-3. **带查询串的路径** —— Claude Code 实际请求 `/v1/messages?beta=true`，`endswith("/messages")` 会匹配失败
-4. **工具调用历史回放错乱** —— assistant 历史消息的 `content: null` 和非标准 `toolu_*` id 会让 Solar 的对话模板状态错乱，第二轮起工具调用以文本形式泄露（`<|tool_call:start|>` 直接吐成正文）。修复：空串替代 null + id 重写为 `call_*` 格式
-
-## 功能
-
-- ✅ 流式 / 非流式（完整 Anthropic SSE 事件序列：`message_start` → `content_block_*` → `message_delta` → `message_stop`）
-- ✅ function calling 双向转换（`tools` / `tool_use` / `tool_result`），Claude Code 多轮 agent 任务实测通过
-- ✅ 模型映射：`claude-*haiku*` → `solar-mini4`（轻活），其余 → `solar-pro4`（重活），可用环境变量覆盖
-- ✅ **512K 上下文**：solar-pro4 原生 512K 窗口（输出 128K），已超出 Claude Code 默认假设的 200K —— 配合 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=512000` 即可吃满（见下方 cc-switch 配置）
-- ✅ `thinking` 预算 → `reasoning_effort`（low/medium/high）自动映射
-- ✅ `/v1/messages/count_tokens` 估算、`GET /v1/models`（Claude Code 启动校验需要）
-- ✅ 工具调用往返延迟低（实测单轮 2-6s，含上游推理时间）
-
-## 快速开始
+### 1. 启动
 
 ```bash
 git clone https://github.com/DaBinBinah/solar-proxy.git
@@ -53,44 +42,40 @@ cp .env.example .env
 # 编辑 .env，填入你的 Upstage key（https://console.upstage.ai 获取）
 
 ./start.sh
-# {"status": "ok", ...} 即启动成功
+# 看到 {"status": "ok", ...} 就是起来了
 ```
 
-### 接入 Claude Code（一次性测试）
+### 2. 先试一把
 
 ```bash
 claude -p "你是什么模型" --settings claude_settings.json
-# → 我是 Solar Pro 4，由韩国 Upstage AI 开发的模型。
+# 它会回答：我是 Solar Pro 4，由韩国 Upstage AI 开发的模型。
 ```
 
-### 接入 cc-switch（推荐，一键切换）
+### 3. 加到 cc-switch（日常用推荐这个）
 
-#### 方式一：GUI 手动添加
+**方式一：界面上加**
 
-1. 启动代理：`./start.sh`
-2. 打开 cc-switch → Claude 页签 → 「添加供应商 / Add Provider」→ 选自定义（Custom）
-3. 名称随意（如 `Solar Pro 4 (本地反代)`），配置照抄下表：
+打开 cc-switch → Claude 页签 → 添加自定义供应商，配置照抄：
 
 | 键 | 值 |
 |---|---|
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8787` |
-| `ANTHROPIC_AUTH_TOKEN` | `local-proxy`（任意非空即可） |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-5`（⚠️ 必须填 Claude Code 认识的模型名，代理负责映射到 solar-pro4） |
+| `ANTHROPIC_AUTH_TOKEN` | `local-proxy`（随便填，非空就行） |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-5`（注意：这里必须填 Claude Code 认识的模型名，映射是代理干的） |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL` | `claude-sonnet-4-5` |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL` | `claude-sonnet-4-5` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claude-haiku-4-5` |
-| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | `512000`（吃满 solar-pro4 的 512K 窗口，不加则按默认 200K 管理） |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | `512000` |
 
-（仓库里的 `claude_settings.json` 就是这份配置，可直接复制粘贴。）
+仓库里的 `claude_settings.json` 就是这份配置，直接复制粘贴也行。保存后点一下这个供应商就切过去了，Claude Code 重开会话生效；想换回去点原来的供应商就行。
 
-4. 保存后点击该供应商即完成切换，Claude Code 重启会话生效；切回原供应商同样一键。
+**方式二：命令行一把梭（cc-switch v3+）**
 
-#### 方式二：命令行一键注册（SQLite 直插）
-
-cc-switch 新版（v3+）用 SQLite 存储供应商配置。**先退出 cc-switch、备份数据库**，然后：
+cc-switch 新版用 SQLite 存配置。先退出 cc-switch，备份数据库，然后：
 
 ```bash
-cp ~/.cc-switch/cc-switch.db ~/.cc-switch/cc-switch.db.bak   # 备份
+cp ~/.cc-switch/cc-switch.db ~/.cc-switch/cc-switch.db.bak
 
 sqlite3 ~/.cc-switch/cc-switch.db "INSERT INTO providers (
   id, app_type, name, settings_config, category,
@@ -102,54 +87,27 @@ sqlite3 ~/.cc-switch/cc-switch.db "INSERT INTO providers (
 );"
 ```
 
-重新打开 cc-switch，就能看到 `Solar Pro 4 (本地反代)` 供应商，点击切换即可。
+重新打开 cc-switch 就能看到这个供应商了。表结构各版本可能有差异，拿 `sqlite3 ~/.cc-switch/cc-switch.db ".schema providers"` 确认一下。
 
-> 注意：表结构以你安装的 cc-switch 版本为准（`sqlite3 ~/.cc-switch/cc-switch.db ".schema providers"` 可查）；老版 cc-switch 用 `~/.cc-switch/config.json` 存配置，直接按 GUI 方式添加即可。切换后代理必须处于运行状态（`./start.sh`），否则 Claude Code 会报连接错误。
+**别忘了**：切换过去之后代理得在跑（`./start.sh`），代理没跑 Claude Code 会报连接错误。
 
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `UPSTAGE_API_KEY` | （必填） | Upstage 控制台获取 |
+| `UPSTAGE_API_KEY` | （必填） | Upstage 控制台拿 |
 | `PORT` | `8787` | 监听端口 |
-| `BIG_MODEL` | `solar-pro4` | 主模型（sonnet/opus 槽位） |
+| `BIG_MODEL` | `solar-pro4` | 主模型 |
 | `SMALL_MODEL` | `solar-mini4` | 轻量模型（haiku 槽位） |
-| `UPSTAGE_BASE_URL` | `https://api.upstage.ai/v1` | 上游地址（理论上可指向任意 OpenAI 兼容上游） |
+| `UPSTAGE_BASE_URL` | `https://api.upstage.ai/v1` | 上游地址 |
 
-## 工作原理
+## 已知问题
 
-```
-Claude Code                    solar-proxy                     Upstage
-    │  POST /v1/messages?beta=true   │                              │
-    │  (Anthropic Messages 格式)     │                              │
-    │ ─────────────────────────────► │  POST /chat/completions      │
-    │                                │  (OpenAI 格式 + stream)      │
-    │                                │ ────────────────────────────►│
-    │                                │  SSE: chat.completion.chunk  │
-    │  SSE: message_start /          │◄────────────────────────────│
-    │       content_block_delta /    │  逐块转换（文本/工具调用/用量）│
-    │       input_json_delta ...     │                              │
-    │◄───────────────────────────── │                              │
-```
+- Solar 是纯文本模型，看不了图。Claude Code 里发截图会被直接忽略
+- `count_tokens` 是按字符数估的（中文大概 0.7 token 一个字），不是精确值
 
-核心转换逻辑（`proxy.py`）：
+## 最后
 
-- `convert_request()`：system 合并、`tool_use`→`tool_calls`、`tool_result`→`role:"tool"`、工具 id 重写、thinking→reasoning_effort
-- `StreamTransformer`：OpenAI chunk 流 → Anthropic SSE 事件流，文本块与工具调用块按序编号
-- `stop_reason` 映射：`tool_calls`→`tool_use`、`length`→`max_tokens`、其余→`end_turn`
+仅供个人学习研究使用，和 Upstage、Anthropic 都没有关系，账号和费用风险自己把握。
 
-## 已知限制
-
-- Solar 是**纯文本模型**：Claude Code 里的图片/截图输入会被丢弃
-- `count_tokens` 是字符估算值（中文约 0.7 token/字 + 每请求固定开销），非精确计量
-
-## 免责声明
-
-本项目为个人开发的第三方工具，与 Upstage AI、Anthropic 均无关联。
-请遵守各服务商的服务条款；因使用本工具产生的账号风险与费用由使用者自行承担。
-
-## License
-
-[MIT](LICENSE) © 2026 DaBinBinah
-
-如果对你有用，欢迎 ⭐ Star —— 这是我第六个开源项目 🎉
+MIT License，觉得有用点个 star，这是我的第六个开源项目。
