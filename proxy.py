@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+solar-proxy — 把 Upstage solar 系列模型代理成 Anthropic Messages API，供 Claude Code 使用。
+
+  Claude Code (Anthropic 协议) → 本代理 (127.0.0.1:8787) → Upstage (OpenAI 协议)
+
+支持：流式/非流式、function calling（tool_use/tool_result 双向转换）、模型映射
+（claude-*haiku* → solar-mini4，其余 → solar-pro4）、/v1/messages/count_tokens 估算。
+
+仅依赖：Python 3.9+ 标准库 + requests。
+环境变量：UPSTAGE_API_KEY、PORT(默认8787)、BIG_MODEL(默认solar-pro4)、SMALL_MODEL(默认solar-mini4)
+"""
+import json
+import os
+import sys
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+
+UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY", "")
+UPSTAGE_BASE = os.environ.get("UPSTAGE_BASE_URL", "https://api.upstage.ai/v1")
+PORT = int(os.environ.get("PORT", "8787"))
+BIG_MODEL = os.environ.get("BIG_MODEL", "solar-pro4")
+SMALL_MODEL = os.environ.get("SMALL_MODEL", "solar-mini4")
+VERBOSE = os.environ.get("VERBOSE", "1") == "1"
+
+
+def log(*a):
+    if VERBOSE:
+        print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+
+def map_model(an_thropic_model: str) -> str:
+    if not an_thropic_model:
+        return BIG_MODEL
+    m = an_thropic_model.lower()
+    if m.startswith("solar"):
+        return an_thropic_model  # 已是 solar 模型名，直接透传
+    if "haiku" in m:
+        return SMALL_MODEL
+    return BIG_MODEL
+
+
+# ─────────────────────────── 请求转换：Anthropic → OpenAI ───────────────────────────
+
+def _text_of_content(content) -> str:
+    """Anthropic content（字符串或块数组）→ 纯文本（取 text 部分）"""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for b in content or []:
+        if isinstance(b, dict) and b.get("type") == "text":
+            parts.append(b.get("text", ""))
+    return "\n".join(parts)
+
+
+def convert_request(payload: dict):
+    """返回 (openai_payload, est_input_chars)"""
+    msgs_out, char_count = [], 0
+    id_map = {}  # toolu_* → call_*（部分模型对非标准 id 的历史工具消息会模板错乱）
+
+    def rid(tid):
+        if not tid:
+            return tid
+        if tid.startswith("call_"):
+            return tid  # 已是标准格式，透传
+        if tid not in id_map:
+            id_map[tid] = "call_" + uuid.uuid4().hex[:12]
+        return id_map[tid]
+
+    # system
+    system_text = _text_of_content(payload.get("system"))
+    if system_text:
+        msgs_out.append({"role": "system", "content": system_text})
+        char_count += len(system_text)
+
+    for msg in payload.get("messages", []):
+        role, content = msg.get("role"), msg.get("content")
+        char_count += len(_text_of_content(content))
+        if isinstance(content, str):
+            msgs_out.append({"role": role, "content": content})
+            continue
+
+        if role == "assistant":
+            # text 块合并为 content；tool_use 块转为 tool_calls
+            text_parts, tool_calls = [], []
+            for b in content:
+                t = b.get("type")
+                if t == "text":
+                    text_parts.append(b.get("text", ""))
+                elif t == "tool_use":
+                    tool_calls.append({
+                        "id": rid(b.get("id") or None),
+                        "type": "function",
+                        "function": {"name": b.get("name", ""),
+                                     "arguments": json.dumps(b.get("input", {}), ensure_ascii=False)},
+                    })
+                # thinking / redacted_thinking 块丢弃
+            m = {"role": "assistant", "content": "\n".join(text_parts)}
+            if tool_calls:
+                m["tool_calls"] = tool_calls
+            msgs_out.append(m)
+
+        else:  # user
+            # tool_result → 独立 role:"tool" 消息（必须紧跟对应 assistant）；其余 text 归 user
+            pending_text = []
+            for b in content:
+                t = b.get("type")
+                if t == "tool_result":
+                    inner = b.get("content")
+                    if isinstance(inner, str):
+                        tool_text = inner
+                    else:
+                        tool_text = "\n".join(
+                            x.get("text", "") for x in (inner or []) if isinstance(x, dict))
+                    prefix = "[工具执行出错] " if b.get("is_error") else ""
+                    msgs_out.append({"role": "tool",
+                                     "tool_call_id": rid(b.get("tool_use_id", "")),
+                                     "content": prefix + tool_text})
+                    char_count += len(tool_text)
+                elif t == "text":
+                    pending_text.append(b.get("text", ""))
+                # image / thinking 等块丢弃（solar 为纯文本模型）
+            if pending_text:
+                msgs_out.append({"role": "user", "content": "\n".join(pending_text)})
+
+    out = {"model": map_model(payload.get("model", "")),
+           "messages": msgs_out,
+           "max_tokens": min(int(payload.get("max_tokens") or 4096), 32768)}
+
+    if payload.get("temperature") is not None:
+        out["temperature"] = payload["temperature"]
+    if payload.get("top_p") is not None:
+        out["top_p"] = payload["top_p"]
+    if payload.get("stop_sequences"):
+        out["stop"] = payload["stop_sequences"]
+
+    # thinking 参数 → reasoning_effort（按预算粗略映射）
+    thinking = payload.get("thinking") or {}
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens", 8192)
+        out["reasoning_effort"] = "low" if budget < 4096 else ("medium" if budget < 20000 else "high")
+
+    # tools
+    tools = []
+    for t in payload.get("tools", []):
+        params = dict(t.get("input_schema") or {})
+        params.pop("$schema", None)
+        tools.append({"type": "function",
+                      "function": {"name": t.get("name", ""),
+                                   "description": t.get("description", ""),
+                                   "parameters": params}})
+    if tools:
+        out["tools"] = tools
+        char_count += sum(len(json.dumps(t, ensure_ascii=False)) for t in payload.get("tools", [])) // 2
+
+    tc = payload.get("tool_choice")
+    if tc:
+        ty = tc.get("type")
+        if ty == "auto":
+            out["tool_choice"] = "auto"
+        elif ty == "any":
+            out["tool_choice"] = "required"
+        elif ty == "tool":
+            out["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+
+    return out, char_count
+
+
+# ─────────────────────────── 响应转换：OpenAI → Anthropic ───────────────────────────
+
+def stop_reason_of(finish: str) -> str:
+    return {"tool_calls": "tool_use", "length": "max_tokens"}.get(finish or "", "end_turn")
+
+
+def convert_response_nonstream(openai_resp: dict, requested_model: str) -> dict:
+    choice = (openai_resp.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = []
+    if msg.get("content"):
+        content.append({"type": "text", "text": msg["content"]})
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {"_raw": fn.get("arguments", "")}
+        content.append({"type": "tool_use", "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
+                        "name": fn.get("name", ""), "input": args})
+    if not content:
+        content = [{"type": "text", "text": "(空响应)"}]
+    usage = openai_resp.get("usage") or {}
+    return {
+        "id": "msg_" + uuid.uuid4().hex[:24],
+        "type": "message",
+        "role": "assistant",
+        "model": requested_model,
+        "content": content,
+        "stop_reason": stop_reason_of(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                  "output_tokens": usage.get("completion_tokens", 0),
+                  "cache_creation_input_tokens": 0,
+                  "cache_read_input_tokens": 0},
+    }
+
+
+class StreamTransformer:
+    """把 OpenAI SSE 流改写为 Anthropic SSE 流"""
+
+    def __init__(self, requested_model: str, est_input_tokens: int):
+        self.model = requested_model
+        self.est_input = est_input_tokens
+        self.next_index = 0
+        self.text_open = None          # 当前 text 块 index 或 None
+        self.tool_blocks = {}          # openai tool index → {"block": idx, "opened": bool}
+        self.out_chars = 0
+        self.final_usage = None
+
+    def sse(self, event: str, data: dict) -> bytes:
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+
+    def start(self) -> bytes:
+        msg = {"type": "message", "id": "msg_" + uuid.uuid4().hex[:24], "role": "assistant",
+               "model": self.model, "content": [], "stop_reason": None, "stop_sequence": None,
+               "usage": {"input_tokens": self.est_input, "output_tokens": 0,
+                         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        return (self.sse("message_start", {"type": "message_start", "message": msg})
+                + self.sse("ping", {"type": "ping"}))
+
+    def _open_text(self):
+        self.text_open = self.next_index
+        self.next_index += 1
+        return self.sse("content_block_start", {"type": "content_block_start", "index": self.text_open,
+                                                "content_block": {"type": "text", "text": ""}})
+
+    def on_chunk(self, chunk: dict):
+        """处理一个 OpenAI chunk，返回要下发的字节（可能为空）"""
+        out = b""
+        if chunk.get("usage"):
+            self.final_usage = chunk["usage"]
+        choices = chunk.get("choices") or []
+        if not choices:
+            return out
+        delta = choices[0].get("delta") or {}
+
+        text = delta.get("content")
+        if text:
+            self.out_chars += len(text)
+            if self.text_open is None:
+                out += self._open_text()
+            out += self.sse("content_block_delta",
+                            {"type": "content_block_delta", "index": self.text_open,
+                             "delta": {"type": "text_delta", "text": text}})
+        # reasoning 增量不转发（保持 Anthropic 协议简单）
+
+        for tc in delta.get("tool_calls") or []:
+            oi = tc.get("index", 0)
+            blk = self.tool_blocks.setdefault(oi, {"block": None, "id": None, "name": ""})
+            fn = tc.get("function") or {}
+            if blk["block"] is None:
+                blk["block"] = self.next_index
+                self.next_index += 1
+                blk["id"] = tc.get("id") or f"toolu_{uuid.uuid4().hex[:12]}"
+                blk["name"] = fn.get("name", "")
+                out += self.sse("content_block_start", {"type": "content_block_start", "index": blk["block"],
+                                                        "content_block": {"type": "tool_use", "id": blk["id"],
+                                                                          "name": blk["name"], "input": {}}})
+            args = fn.get("arguments")
+            if args:
+                out += self.sse("content_block_delta", {"type": "content_block_delta", "index": blk["block"],
+                                                        "delta": {"type": "input_json_delta", "partial_json": args}})
+        return out
+
+    def finish(self, finish_reason: str) -> bytes:
+        out = b""
+        if self.text_open is not None:
+            out += self.sse("content_block_stop", {"type": "content_block_stop", "index": self.text_open})
+        for oi in sorted(self.tool_blocks):
+            out += self.sse("content_block_stop",
+                            {"type": "content_block_stop", "index": self.tool_blocks[oi]["block"]})
+        stop = stop_reason_of(finish_reason)
+        out_tokens = (self.final_usage or {}).get("completion_tokens") or max(1, self.out_chars // 3)
+        out += self.sse("message_delta", {"type": "message_delta",
+                                          "delta": {"stop_reason": stop, "stop_sequence": None},
+                                          "usage": {"output_tokens": out_tokens}})
+        out += self.sse("message_stop", {"type": "message_stop"})
+        return out
+
+
+# ─────────────────────────── HTTP 服务 ───────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # 静默默认访问日志
+        pass
+
+    def _json(self, code: int, obj: dict):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _anthropic_error(self, code: int, etype: str, message: str):
+        self._json(code, {"type": "error", "error": {"type": etype, "message": message}})
+
+    def do_GET(self):
+        if self.path in ("/health", "/"):
+            self._json(200, {"status": "ok", "upstream": UPSTAGE_BASE,
+                             "models": {"big": BIG_MODEL, "small": SMALL_MODEL}})
+        elif self.path.startswith("/v1/models"):
+            # Anthropic 模型列表 API：Claude Code 启动时会查询校验
+            now = "2025-01-01T00:00:00Z"
+            data = [{"type": "model", "id": m, "display_name": n, "created_at": now}
+                    for m, n in [("claude-sonnet-4-5", f"Sonnet (→{BIG_MODEL})"),
+                                 ("claude-haiku-4-5", f"Haiku (→{SMALL_MODEL})"),
+                                 ("solar-pro4", "Solar Pro 4"), ("solar-mini4", "Solar Mini 4")]]
+            self._json(200, {"data": data, "has_more": False, "first_id": data[0]["id"],
+                             "last_id": data[-1]["id"]})
+        else:
+            log(f"? 未处理的 GET {self.path}")
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            return self._anthropic_error(400, "invalid_request_error", "请求体不是合法 JSON")
+
+        path = self.path.split("?", 1)[0]  # Claude Code 会带 ?beta=true 之类的查询串
+        if path.endswith("/count_tokens"):
+            _, chars = convert_request(payload)
+            return self._json(200, {"input_tokens": max(1, int(chars * 0.75) + 64)})
+
+        if not path.endswith("/messages"):
+            log(f"? 未处理的 POST {self.path}")
+            return self._anthropic_error(404, "not_found_error", f"未知路径 {self.path}")
+
+        requested_model = payload.get("model", "")
+        try:
+            upstream_payload, in_chars = convert_request(payload)
+        except Exception as e:
+            return self._anthropic_error(400, "invalid_request_error", f"请求转换失败: {e}")
+
+        want_stream = bool(payload.get("stream"))
+        if want_stream:
+            upstream_payload["stream"] = True
+            upstream_payload["stream_options"] = {"include_usage": True}
+        est_input = max(1, int(in_chars * 0.75) + 64)
+        t0 = time.time()
+        log(f"→ {upstream_payload['model']} | msgs={len(upstream_payload['messages'])} "
+            f"tools={len(upstream_payload.get('tools', []))} | stream={want_stream}")
+
+        try:
+            resp = requests.post(f"{UPSTAGE_BASE}/chat/completions",
+                                 headers={"Authorization": f"Bearer {UPSTAGE_API_KEY}"},
+                                 json=upstream_payload, stream=want_stream, timeout=(10, 600))
+        except requests.RequestException as e:
+            return self._anthropic_error(502, "api_error", f"上游连接失败: {e}")
+
+        if resp.status_code != 200:
+            try:
+                detail = resp.json()
+            except ValueError:
+                detail = resp.text[:500]
+            log(f"✗ 上游 {resp.status_code}: {str(detail)[:200]}")
+            return self._anthropic_error(resp.status_code if resp.status_code < 500 else 502,
+                                         "api_error", f"Upstage 错误: {detail}")
+
+        if not want_stream:
+            result = convert_response_nonstream(resp.json(), requested_model)
+            log(f"✓ {time.time()-t0:.1f}s in={result['usage']['input_tokens']} "
+                f"out={result['usage']['output_tokens']} stop={result['stop_reason']}")
+            return self._json(200, result)
+
+        # ── 流式 ──
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")  # SSE 结束即断，规避长度不确定
+        self.end_headers()
+        transformer = StreamTransformer(requested_model, est_input)
+        finish = None
+        n_lines, n_chunks, n_errs = 0, 0, 0
+        try:
+            resp.encoding = "utf-8"  # SSE 无 charset 声明，requests 默认 latin-1 会弄乱中文
+            self.wfile.write(transformer.start())
+            for raw in resp.iter_lines(decode_unicode=True):
+                n_lines += 1
+                if n_lines <= 2:
+                    log(f"上游行样例: {raw!r}"[:150])
+                if not raw or not raw.startswith("data:"):
+                    continue
+                data_str = raw[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    n_errs += 1
+                    if n_errs <= 2:
+                        log("JSON解析失败样例:", data_str[:150])
+                    continue
+                n_chunks += 1
+                fr = (chunk.get("choices") or [{}])[0].get("finish_reason")
+                if fr:
+                    finish = fr
+                piece = transformer.on_chunk(chunk)
+                if piece:
+                    self.wfile.write(piece)
+                    self.wfile.flush()
+            self.wfile.write(transformer.finish(finish or "stop"))
+            self.wfile.flush()
+            log(f"✓ {time.time()-t0:.1f}s 行={n_lines} 块={n_chunks} 解析错={n_errs} "
+                f"out={transformer.final_usage and transformer.final_usage.get('completion_tokens')} stop={finish}")
+        except (BrokenPipeError, ConnectionResetError):
+            log("客户端断开")
+        except Exception as e:
+            log(f"✗ 流式处理异常: {e!r}")
+
+
+def main():
+    if not UPSTAGE_API_KEY:
+        print("错误: 未设置 UPSTAGE_API_KEY 环境变量（在 https://console.upstage.ai 获取）")
+        print('  用法: UPSTAGE_API_KEY=up_xxx python3 proxy.py')
+        sys.exit(1)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server.daemon_threads = True
+    print(f"solar-proxy 已启动: http://127.0.0.1:{PORT}")
+    print(f"  主模型 → {BIG_MODEL}   轻量模型(haiku槽位) → {SMALL_MODEL}")
+    print(f"  上游: {UPSTAGE_BASE}")
+    print("Claude Code 接法:")
+    print(f'  export ANTHROPIC_BASE_URL=http://127.0.0.1:{PORT}')
+    print('  export ANTHROPIC_AUTH_TOKEN=local-proxy')
+    print('  export ANTHROPIC_MODEL=solar-pro4')
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

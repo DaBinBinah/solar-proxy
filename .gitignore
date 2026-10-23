@@ -1,0 +1,6 @@
+.env
+proxy_run.log
+proxy.pid
+__pycache__/
+*.pyc
+.DS_Store
