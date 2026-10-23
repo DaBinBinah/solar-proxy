@@ -37,6 +37,7 @@ Claude Code 以为自己在和 `claude-sonnet-4-5` 说话，实际背后跑的�
 - ✅ 流式 / 非流式（完整 Anthropic SSE 事件序列：`message_start` → `content_block_*` → `message_delta` → `message_stop`）
 - ✅ function calling 双向转换（`tools` / `tool_use` / `tool_result`），Claude Code 多轮 agent 任务实测通过
 - ✅ 模型映射：`claude-*haiku*` → `solar-mini4`（轻活），其余 → `solar-pro4`（重活），可用环境变量覆盖
+- ✅ **512K 上下文**：solar-pro4 原生 512K 窗口（输出 128K），已超出 Claude Code 默认假设的 200K —— 配合 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=512000` 即可吃满（见下方 cc-switch 配置）
 - ✅ `thinking` 预算 → `reasoning_effort`（low/medium/high）自动映射
 - ✅ `/v1/messages/count_tokens` 估算、`GET /v1/models`（Claude Code 启动校验需要）
 - ✅ 工具调用往返延迟低（实测单轮 2-6s，含上游推理时间）
@@ -64,16 +65,46 @@ claude -p "你是什么模型" --settings claude_settings.json
 
 ### 接入 cc-switch（推荐，一键切换）
 
-在 cc-switch 新增自定义供应商，`claude_settings.json` 里的 env 块照抄即可：
+#### 方式一：GUI 手动添加
+
+1. 启动代理：`./start.sh`
+2. 打开 cc-switch → Claude 页签 → 「添加供应商 / Add Provider」→ 选自定义（Custom）
+3. 名称随意（如 `Solar Pro 4 (本地反代)`），配置照抄下表：
 
 | 键 | 值 |
 |---|---|
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8787` |
-| `ANTHROPIC_AUTH_TOKEN` | `local-proxy`（任意非空） |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-5`（名字必须是 Claude Code 认识的，代理负责映射） |
+| `ANTHROPIC_AUTH_TOKEN` | `local-proxy`（任意非空即可） |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-5`（⚠️ 必须填 Claude Code 认识的模型名，代理负责映射到 solar-pro4） |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `claude-sonnet-4-5` |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | `claude-sonnet-4-5` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claude-haiku-4-5` |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | `512000`（吃满 solar-pro4 的 512K 窗口，不加则按默认 200K 管理） |
 
-之后在 cc-switch 里点击切换，Claude Code 重启会话即生效；切回原供应商同样一键。
+（仓库里的 `claude_settings.json` 就是这份配置，可直接复制粘贴。）
+
+4. 保存后点击该供应商即完成切换，Claude Code 重启会话生效；切回原供应商同样一键。
+
+#### 方式二：命令行一键注册（SQLite 直插）
+
+cc-switch 新版（v3+）用 SQLite 存储供应商配置。**先退出 cc-switch、备份数据库**，然后：
+
+```bash
+cp ~/.cc-switch/cc-switch.db ~/.cc-switch/cc-switch.db.bak   # 备份
+
+sqlite3 ~/.cc-switch/cc-switch.db "INSERT INTO providers (
+  id, app_type, name, settings_config, category,
+  created_at, sort_index, meta, is_current
+) VALUES (
+  'solar-proxy-local', 'claude', 'Solar Pro 4 (本地反代)',
+  '{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"local-proxy\",\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:8787\",\"ANTHROPIC_MODEL\":\"claude-sonnet-4-5\",\"ANTHROPIC_DEFAULT_SONNET_MODEL\":\"claude-sonnet-4-5\",\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"claude-sonnet-4-5\",\"ANTHROPIC_DEFAULT_HAIKU_MODEL\":\"claude-haiku-4-5\",\"CLAUDE_CODE_MAX_CONTEXT_TOKENS\":\"512000\"}}',
+  'custom', (strftime('%s','now')*1000), 99, '{}', 0
+);"
+```
+
+重新打开 cc-switch，就能看到 `Solar Pro 4 (本地反代)` 供应商，点击切换即可。
+
+> 注意：表结构以你安装的 cc-switch 版本为准（`sqlite3 ~/.cc-switch/cc-switch.db ".schema providers"` 可查）；老版 cc-switch 用 `~/.cc-switch/config.json` 存配置，直接按 GUI 方式添加即可。切换后代理必须处于运行状态（`./start.sh`），否则 Claude Code 会报连接错误。
 
 ## 配置
 
@@ -110,17 +141,7 @@ Claude Code                    solar-proxy                     Upstage
 ## 已知限制
 
 - Solar 是**纯文本模型**：Claude Code 里的图片/截图输入会被丢弃
-- 上游上下文窗口比 Claude 小，超长会话会收到上游报错（代理原样透传，方便定位）
 - `count_tokens` 是字符估算值（中文约 0.7 token/字 + 每请求固定开销），非精确计量
-
-## 同类项目
-
-| 项目 | 特点 |
-|---|---|
-| [claude-code-router](https://github.com/musistudio/claude-code-router) | 功能最全的多模型路由器（Node） |
-| [LiteLLM](https://github.com/BerriAI/litellm) | 企业级网关，100+ 提供商（Python，重） |
-| [anthropic-proxy](https://github.com/maxnowack/anthropic-proxy) | 同类协议转换（Node/TypeScript） |
-| **solar-proxy** | **单文件零依赖，专为 Upstage Solar 实测调优** |
 
 ## 免责声明
 
